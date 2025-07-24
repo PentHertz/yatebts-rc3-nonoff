@@ -1,0 +1,63 @@
+==== Installation
+
+Use source code in this tarball. Compile, install, and operate Yate and YateBTS
+based on these instructions:
+
+https://github.com/Nuand/bladeRF/wiki/Setting-up-Yate-and-YateBTS-with-the-bladeRF#Building_and_Installing_Yate__YateBTS
+
+==== Running
+
+Before starting Yate, load the FPGA. Do not rely on autoload feature.
+Find the appropriate RBF for your device's version and size, for example the
+bladeRF 2.0 micro xA4 can be loaded as follows:
+
+bladeRF-cli -l hostedxA4.rbf
+sleep 1
+sudo yate
+
+If yate hangs or freezes, try to exit the program and run
+`sudo killall -9 mbts yate`. Reload the FPGA, and rerun yate.
+If problems persist plug the device into another USB port.
+
+==== Fine tuning
+
+Yate's architecture is to generate as many future TX bursts as possible
+until the TX fifos start blocking. Essentially RadioInterface::send() is
+supposed to block until there is enough buffer room between
+libusb->FX3->FPGA to fit another 1024 sample buffer.
+
+Yate's expects to generate TX burst roughly 2 subframes before their
+RF transmission. To calculate how many samples 2 subframes correspond to,
+multiply the following:
+
+   2 subframes
+   8 timeslots / subframe
+   156.25 symbols / timeslot
+   8 IQ samples / symbol
+
+   2*8*156.25*8= 20,000 IQ samples
+
+24 buffers * 1024 samples is about 24576 samples, which (factoring in
+some processing lag) corresponds to Yate's expectation of sending TX
+bursts 2 sub frames before RF transmission.
+
+The buffer size, and num buffers, num_transfers numbers were chosen
+based on this methodlogy, however they might need to be tuned depending
+on the USB host controller, CPU, and OS settings.
+
+HOW TO TUNE:
+Define '#define BRF_DEBUG' at the top of ybladerf.cpp and recompile and
+install yate.
+
+
+Strong deviations from 20,000 samples is not good, however issues really
+only arise (and they do so visibly) if the time difference number drops
+below 5,000 (or goes negative) TX bursts will not make it to the FPGA in
+time to be sent over the SMA port. In this case, consider increasing the
+"num buffers" and "num transfers" in unison.
+
+If CPU throughput is the issue, multiply buffer_size by a factor of 2,
+and divide "num buffers" and "num transfers" by the same number.
+
+Increasing "num transfers" is helpful if USB timeout errors appearing.
+Care must be taken to not increase this number past 50% of "num buffers"
