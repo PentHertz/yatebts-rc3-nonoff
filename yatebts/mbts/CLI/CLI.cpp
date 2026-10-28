@@ -49,6 +49,7 @@
 #include <GPRSExport.h>
 #include <MAC.h>
 #include <Sockets.h>
+#include <unistd.h>
 
 namespace SGSN {
 	extern int sgsnCLI(int argc, char **argv, std::ostream &os);
@@ -977,70 +978,23 @@ int chans(int argc, char **argv, ostream& os)
 }
 
 
-/**
-	Inject raw Layer-3 frames onto an active dedicated channel.
-
-	Opens a UDP socket; each datagram received is wrapped verbatim in an L3Frame
-	and sent down to the handset on the selected channel/SAPI, then the handset's
-	reply (if any) is written back to the UDP peer as raw bytes.  This lets an
-	external tool (e.g. pycrate/libmich crafting MM, CC, RR, ... messages) talk to
-	a handset for interaction/fuzzing.
-
-	Unlike OpenBTS-rc3 "testcall", mbts does not run call control (that lives in
-	Yate), so this cannot page an idle MS.  It injects onto a channel that is
-	already active, i.e. one the MS currently holds for a transaction (location
-	update, SMS, or a call).
-
-	Usage:
-	  testinject                       -- list active dedicated channels and their index
-	  testinject <index> [port] [sapi] -- inject onto active channel <index>
-	                                      (port default 28670, sapi default 0;
-	                                       SAPI0=MM/CC/RR, SAPI3=SMS CP/RP)
-*/
-int testinject(int argc, char **argv, ostream& os)
+// Collect the currently-active dedicated channels (SDCCHs then TCHs) into out.
+// The pool accessors return a const reference to the vector, but the channel
+// objects themselves are non-const, so send()/recv() are callable.
+static void testinjectCollectActive(vector<GSM::LogicalChannel*>& out)
 {
-	if (argc > 4) return BAD_NUM_ARGS;
+	out.clear();
+	for (GSM::SDCCHList::const_iterator it = gBTS.SDCCHPool().begin(); it != gBTS.SDCCHPool().end(); ++it)
+		if ((*it)->active()) out.push_back(*it);
+	for (GSM::TCHList::const_iterator it = gBTS.TCHPool().begin(); it != gBTS.TCHPool().end(); ++it)
+		if ((*it)->active()) out.push_back(*it);
+}
 
-	// Build a stable list of active dedicated channels: SDCCHs then TCHs.
-	// The pool accessors return a const reference to the vector, but the channel
-	// objects themselves are non-const, so send()/recv() are callable.
-	vector<GSM::LogicalChannel*> active;
-	for (GSM::SDCCHList::const_iterator it = gBTS.SDCCHPool().begin(); it != gBTS.SDCCHPool().end(); ++it) {
-		if ((*it)->active()) active.push_back(*it);
-	}
-	for (GSM::TCHList::const_iterator it = gBTS.TCHPool().begin(); it != gBTS.TCHPool().end(); ++it) {
-		if ((*it)->active()) active.push_back(*it);
-	}
-
-	// No index: just list what is injectable right now.
-	if (argc < 2) {
-		os << "Active dedicated channels (inject with: testinject <index> [port] [sapi]):" << endl;
-		if (active.empty()) {
-			os << "  (none active -- a dedicated channel exists only while the MS is in a" << endl
-			   << "   transaction: location update, SMS, or a call. Trigger one, then rerun.)" << endl;
-		} else {
-			for (size_t i = 0; i < active.size(); i++)
-				os << "  [" << i << "] " << active[i]->descriptiveString() << endl;
-		}
-		return SUCCESS;
-	}
-
-	char *endp = NULL;
-	unsigned long idx = strtoul(argv[1], &endp, 0);
-	if (endp == argv[1] || *endp) { os << argv[1] << " is not a valid index" << endl; return BAD_VALUE; }
-	if (idx >= active.size()) {
-		os << "no active channel at index " << idx << " (" << active.size() << " active)" << endl;
-		return BAD_VALUE;
-	}
-	GSM::LogicalChannel *chan = active[idx];
-
-	int port = (argc >= 3) ? atoi(argv[2]) : 28670;
-	if (port <= 0 || port > 65535) { os << "invalid port " << port << endl; return BAD_VALUE; }
-	unsigned sapi = (argc >= 4) ? (unsigned)strtoul(argv[3], NULL, 0) : 0;
-	if (sapi > 3) { os << "SAPI must be 0..3" << endl; return BAD_VALUE; }
-
+// Run the UDP inject/receive loop on an already-chosen, active channel.
+static int testinjectLoop(GSM::LogicalChannel* chan, int port, unsigned sapi, ostream& os)
+{
 	UDPSocket controlSocket((unsigned short)port);
-	os << "L3 injection on channel [" << idx << "] " << chan->descriptiveString()
+	os << "L3 injection on " << chan->descriptiveString()
 	   << " SAPI" << sapi << "; UDP listening on port " << port
 	   << "; send \"STOP\" to end." << endl;
 
@@ -1079,6 +1033,134 @@ int testinject(int argc, char **argv, ostream& os)
 	controlSocket.close();
 	if (!chan->active()) os << "channel went inactive; injection ended." << endl;
 	return SUCCESS;
+}
+
+// Poll the active-channel pools until a channel appears that was not in
+// 'before' (a newly-established transaction), or until timeout.  Returns the
+// new channel, or NULL on timeout.
+static GSM::LogicalChannel* testinjectWaitNew(const vector<GSM::LogicalChannel*>& before,
+	int waitMs, int pollMs)
+{
+	for (int waited = 0; waited < waitMs; waited += pollMs) {
+		vector<GSM::LogicalChannel*> now;
+		testinjectCollectActive(now);
+		for (size_t i = 0; i < now.size(); i++)
+			if (std::find(before.begin(), before.end(), now[i]) == before.end())
+				return now[i];
+		usleep(pollMs * 1000);
+	}
+	return NULL;
+}
+
+/**
+	Inject raw Layer-3 frames onto an active dedicated channel.
+
+	Opens a UDP socket; each datagram received is wrapped verbatim in an L3Frame
+	and sent down to the handset on the selected channel/SAPI, then the handset's
+	reply (if any) is written back to the UDP peer as raw bytes.  This lets an
+	external tool (e.g. pycrate/libmich crafting MM, CC, RR, ... messages) talk to
+	a handset for interaction/fuzzing.
+
+	mbts does not run call control (that lives in Yate).  A dedicated channel
+	exists only while the MS holds one for a transaction (location update, SMS,
+	or a call).  The "page" mode forces the MS onto an SDCCH by paging it (the MS
+	answers with a Paging Response); this is the closest equivalent to the
+	OpenBTS-rc3 "testcall".  Note the channel may be short-lived because Yate,
+	having no matching transaction, will release it, so "wait"/"page" latch onto
+	the channel the instant it appears to give an injection window.
+
+	Usage:
+	  testinject                           -- list active dedicated channels + index
+	  testinject <index> [port] [sapi]     -- inject onto active channel <index>
+	  testinject wait [port] [sapi]        -- block for the NEXT channel, then inject
+	  testinject page <IMSI> [port] [sapi] -- page <IMSI> onto an SDCCH, then inject
+	  (port default 28670, sapi default 0; SAPI0=MM/CC/RR, SAPI3=SMS CP/RP)
+*/
+int testinject(int argc, char **argv, ostream& os)
+{
+	if (argc > 5) return BAD_NUM_ARGS;
+
+	// No argument: list what is injectable right now.
+	if (argc < 2) {
+		vector<GSM::LogicalChannel*> active;
+		testinjectCollectActive(active);
+		os << "Active dedicated channels (inject with: testinject <index> [port] [sapi]):" << endl;
+		if (active.empty()) {
+			os << "  (none active -- a dedicated channel exists only during a transaction." << endl
+			   << "   Use 'testinject wait' or 'testinject page <IMSI>' to get one.)" << endl;
+		} else {
+			for (size_t i = 0; i < active.size(); i++)
+				os << "  [" << i << "] " << active[i]->descriptiveString() << endl;
+		}
+		return SUCCESS;
+	}
+
+	const int POLL_MS = 200;
+	const int WAIT_MS = 120000;	// give up after 2 minutes
+
+	// ---- wait mode: testinject wait [port] [sapi] ----
+	if (strcmp(argv[1], "wait") == 0) {
+		int port = (argc >= 3) ? atoi(argv[2]) : 28670;
+		if (port <= 0 || port > 65535) { os << "invalid port " << port << endl; return BAD_VALUE; }
+		unsigned sapi = (argc >= 4) ? (unsigned)strtoul(argv[3], NULL, 0) : 0;
+		if (sapi > 3) { os << "SAPI must be 0..3" << endl; return BAD_VALUE; }
+
+		vector<GSM::LogicalChannel*> before;
+		testinjectCollectActive(before);
+		os << "waiting up to " << (WAIT_MS/1000) << "s for a new dedicated channel -- "
+		   << "trigger a transaction now (call/SMS to the MS, or dial from it)..." << endl;
+		GSM::LogicalChannel* chan = testinjectWaitNew(before, WAIT_MS, POLL_MS);
+		if (!chan) { os << "timed out; no new channel appeared." << endl; return SUCCESS; }
+		os << "latched onto new channel: " << chan->descriptiveString() << endl;
+		return testinjectLoop(chan, port, sapi, os);
+	}
+
+	// ---- page mode: testinject page <IMSI> [port] [sapi] ----
+	if (strcmp(argv[1], "page") == 0) {
+		if (argc < 3) { os << "usage: testinject page <IMSI> [port] [sapi]" << endl; return BAD_NUM_ARGS; }
+		const char* imsi = argv[2];
+		size_t ilen = strlen(imsi);
+		if (ilen == 0 || ilen > 15) { os << imsi << " is not a valid IMSI" << endl; return BAD_VALUE; }
+		for (size_t i = 0; i < ilen; i++)
+			if (imsi[i] < '0' || imsi[i] > '9') { os << imsi << " is not a valid IMSI" << endl; return BAD_VALUE; }
+		int port = (argc >= 4) ? atoi(argv[3]) : 28670;
+		if (port <= 0 || port > 65535) { os << "invalid port " << port << endl; return BAD_VALUE; }
+		unsigned sapi = (argc >= 5) ? (unsigned)strtoul(argv[4], NULL, 0) : 0;
+		if (sapi > 3) { os << "SAPI must be 0..3" << endl; return BAD_VALUE; }
+
+		vector<GSM::LogicalChannel*> before;
+		testinjectCollectActive(before);
+
+		GSM::L3MobileIdentity id(imsi);
+		os << "paging IMSI " << imsi << " onto SDCCH; the MS should answer with a Paging Response..." << endl;
+		gBTS.pager().addID(id, GSM::SDCCHType);
+
+		GSM::LogicalChannel* chan = testinjectWaitNew(before, WAIT_MS, POLL_MS);
+		gBTS.pager().removeID(id);	// stop paging regardless of outcome
+		if (!chan) { os << "timed out; MS did not come up on a channel (not attached, or out of range)." << endl; return SUCCESS; }
+		os << "latched onto new channel: " << chan->descriptiveString() << endl;
+		return testinjectLoop(chan, port, sapi, os);
+	}
+
+	// ---- index mode: testinject <index> [port] [sapi] ----
+	vector<GSM::LogicalChannel*> active;
+	testinjectCollectActive(active);
+
+	char *endp = NULL;
+	unsigned long idx = strtoul(argv[1], &endp, 0);
+	if (endp == argv[1] || *endp) { os << argv[1] << " is not a valid index (expected a number, 'wait', or 'page')" << endl; return BAD_VALUE; }
+	if (idx >= active.size()) {
+		os << "no active channel at index " << idx << " (" << active.size() << " active)" << endl;
+		return BAD_VALUE;
+	}
+	GSM::LogicalChannel *chan = active[idx];
+
+	int port = (argc >= 3) ? atoi(argv[2]) : 28670;
+	if (port <= 0 || port > 65535) { os << "invalid port " << port << endl; return BAD_VALUE; }
+	unsigned sapi = (argc >= 4) ? (unsigned)strtoul(argv[3], NULL, 0) : 0;
+	if (sapi > 3) { os << "SAPI must be 0..3" << endl; return BAD_VALUE; }
+
+	return testinjectLoop(chan, port, sapi, os);
 }
 
 
@@ -1386,7 +1468,7 @@ void Parser::addCommands()
 	addCommand("version", version,"-- print the version string");
 	addCommand("page", page, "print the paging table");
 	addCommand("chans", chans, "-- report PHY status for active channels");
-	addCommand("testinject", testinject, "[index [port [sapi]]] -- list active dedicated channels, or open a UDP socket (default 28670) to inject raw L3 frames (MM/CC/RR/SMS) onto active channel <index>");
+	addCommand("testinject", testinject, "[index|wait|page <IMSI> [port [sapi]]] -- list active dedicated channels; or open a UDP socket (default 28670) to inject raw L3 frames (MM/CC/RR/SMS) onto active channel <index>; 'wait' blocks for the next channel; 'page <IMSI>' pages the MS onto an SDCCH then injects");
 	addCommand("power", power, "[minAtten maxAtten] -- report current attentuation or set min/max bounds");
         addCommand("rxgain", rxgain, "[newRxgain] -- get/set the RX gain in dB");
         addCommand("txatten", txatten, "[newTxAtten] -- get/set the TX attenuation in dB");

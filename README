@@ -61,3 +61,90 @@ and divide "num buffers" and "num transfers" by the same number.
 
 Increasing "num transfers" is helpful if USB timeout errors appearing.
 Care must be taken to not increase this number past 50% of "num buffers"
+
+
+==== L3 message injection (mbts testinject) with pycrate
+
+The mbts "testinject" command opens a UDP socket so you can inject raw Layer 3
+frames (MM, CC, RR, SMS) onto an active dedicated channel and read the handset
+replies. Use it to interact with or fuzz a phone in a controlled test setup
+(your own handset, shielded environment).
+
+Reaching the command: mbts commands are issued from the Yate rmanager console
+with the "mbts" prefix. A bare command goes to Yate (and may hit the Eliza demo
+script), not to mbts. So use "mbts testinject", not "testinject".
+
+Difference from OpenBTS: mbts does not run call control (Yate does). A dedicated
+channel exists only while the MS holds one for a transaction (location update,
+SMS, or a call). testinject can create that channel for you by paging.
+
+Usage:
+  mbts testinject                           list active dedicated channels + index
+  mbts testinject <index> [port] [sapi]     inject onto active channel <index>
+  mbts testinject wait [port] [sapi]        block for the next channel, then inject
+  mbts testinject page <IMSI> [port] [sapi] page the IMSI onto an SDCCH, then inject
+
+Defaults: port 28670, sapi 0. SAPI 0 carries MM/CC/RR, SAPI 3 carries SMS CP/RP.
+Send the text "STOP" over the socket to end a session.
+
+Getting a channel, three ways:
+
+1. page mode (closest to the OpenBTS testcall behaviour):
+     mbts testinject page 001010000000001
+   mbts pages the IMSI; the MS answers with a Paging Response that establishes
+   an SDCCH, and testinject latches onto it. The channel can be short-lived
+   because Yate has no matching transaction and will release it, but the latch
+   still gives an injection window. List attached handsets with:
+     nipc list registered
+
+2. wait mode plus an externally triggered transaction:
+     mbts testinject wait
+   then trigger something: dial a number on the handset, or place a call or send
+   an SMS to it from the NIB web interface. testinject grabs the new channel.
+
+3. index mode, when a transaction is already up:
+     mbts testinject       (shows the index)
+     mbts testinject 0     (inject onto channel 0)
+
+Python example (needs pycrate: pip install pycrate):
+
+    #!/usr/bin/env python3
+    import socket
+    from pycrate_mobile.TS24008_MM import MMIdentityRequest
+    from pycrate_mobile.TS24008_IE import IDTYPE_IMSI
+    from pycrate_mobile.NAS import parse_NAS_MO
+
+    BTS_IP = "127.0.0.1"
+    PORT   = 28670            # mbts testinject default
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(3)
+
+    def inject(raw):
+        "Send raw L3 bytes to the handset, return the raw reply (or b'')."
+        sock.sendto(raw, (BTS_IP, PORT))
+        try:
+            data, _ = sock.recvfrom(1500)
+            return data
+        except socket.timeout:
+            return b""
+
+    # Craft a downlink MM Identity Request asking for the IMSI.
+    req = MMIdentityRequest(val={'IDType': IDTYPE_IMSI})
+    print("inject:", req.to_bytes().hex())     # e.g. 051801
+    resp = inject(req.to_bytes())
+
+    if resp and resp != b"TIMEOUT":
+        print("reply :", resp.hex())
+        msg, err = parse_NAS_MO(resp)          # decode the uplink reply
+        if not err:
+            print(msg.show())
+    else:
+        print("no reply (TIMEOUT or channel gone)")
+
+    sock.sendto(b"STOP", (BTS_IP, PORT))       # end the injection loop
+
+Craft any other message the same way, for example CC messages from
+pycrate_mobile.TS24008_CC (Setup, Alerting, Disconnect, ...) or RR messages.
+Whatever bytes you send are transmitted to the handset without modification.
+For SMS (CP/RP) use SAPI 3, for example: mbts testinject page <IMSI> 28670 3
