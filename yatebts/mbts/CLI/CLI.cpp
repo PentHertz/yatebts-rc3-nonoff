@@ -48,6 +48,7 @@
 #include <Defines.h>
 #include <GPRSExport.h>
 #include <MAC.h>
+#include <Sockets.h>
 
 namespace SGSN {
 	extern int sgsnCLI(int argc, char **argv, std::ostream &os);
@@ -976,6 +977,109 @@ int chans(int argc, char **argv, ostream& os)
 }
 
 
+/**
+	Inject raw Layer-3 frames onto an active dedicated channel.
+
+	Opens a UDP socket; each datagram received is wrapped verbatim in an L3Frame
+	and sent down to the handset on the selected channel/SAPI, then the handset's
+	reply (if any) is written back to the UDP peer as raw bytes.  This lets an
+	external tool (e.g. pycrate/libmich crafting MM, CC, RR, ... messages) talk to
+	a handset for interaction/fuzzing.
+
+	Unlike OpenBTS-rc3 "testcall", mbts does not run call control (that lives in
+	Yate), so this cannot page an idle MS.  It injects onto a channel that is
+	already active, i.e. one the MS currently holds for a transaction (location
+	update, SMS, or a call).
+
+	Usage:
+	  testinject                       -- list active dedicated channels and their index
+	  testinject <index> [port] [sapi] -- inject onto active channel <index>
+	                                      (port default 28670, sapi default 0;
+	                                       SAPI0=MM/CC/RR, SAPI3=SMS CP/RP)
+*/
+int testinject(int argc, char **argv, ostream& os)
+{
+	if (argc > 4) return BAD_NUM_ARGS;
+
+	// Build a stable list of active dedicated channels: SDCCHs then TCHs.
+	// The pool accessors return a const reference to the vector, but the channel
+	// objects themselves are non-const, so send()/recv() are callable.
+	vector<GSM::LogicalChannel*> active;
+	for (GSM::SDCCHList::const_iterator it = gBTS.SDCCHPool().begin(); it != gBTS.SDCCHPool().end(); ++it) {
+		if ((*it)->active()) active.push_back(*it);
+	}
+	for (GSM::TCHList::const_iterator it = gBTS.TCHPool().begin(); it != gBTS.TCHPool().end(); ++it) {
+		if ((*it)->active()) active.push_back(*it);
+	}
+
+	// No index: just list what is injectable right now.
+	if (argc < 2) {
+		os << "Active dedicated channels (inject with: testinject <index> [port] [sapi]):" << endl;
+		if (active.empty()) {
+			os << "  (none active -- a dedicated channel exists only while the MS is in a" << endl
+			   << "   transaction: location update, SMS, or a call. Trigger one, then rerun.)" << endl;
+		} else {
+			for (size_t i = 0; i < active.size(); i++)
+				os << "  [" << i << "] " << active[i]->descriptiveString() << endl;
+		}
+		return SUCCESS;
+	}
+
+	char *endp = NULL;
+	unsigned long idx = strtoul(argv[1], &endp, 0);
+	if (endp == argv[1] || *endp) { os << argv[1] << " is not a valid index" << endl; return BAD_VALUE; }
+	if (idx >= active.size()) {
+		os << "no active channel at index " << idx << " (" << active.size() << " active)" << endl;
+		return BAD_VALUE;
+	}
+	GSM::LogicalChannel *chan = active[idx];
+
+	int port = (argc >= 3) ? atoi(argv[2]) : 28670;
+	if (port <= 0 || port > 65535) { os << "invalid port " << port << endl; return BAD_VALUE; }
+	unsigned sapi = (argc >= 4) ? (unsigned)strtoul(argv[3], NULL, 0) : 0;
+	if (sapi > 3) { os << "SAPI must be 0..3" << endl; return BAD_VALUE; }
+
+	UDPSocket controlSocket((unsigned short)port);
+	os << "L3 injection on channel [" << idx << "] " << chan->descriptiveString()
+	   << " SAPI" << sapi << "; UDP listening on port " << port
+	   << "; send \"STOP\" to end." << endl;
+
+	char iBuf[MAX_UDP_LENGTH];
+	while (chan->active()) {
+		memset(iBuf, 0, sizeof(iBuf));
+		// Use a timeout so we periodically re-check the channel instead of
+		// blocking forever after the MS releases it.
+		int msgLen = controlSocket.read(iBuf, 10000);
+		if (msgLen <= 0) continue;	// timeout or error: nothing this round
+
+		string ctl(iBuf, msgLen);
+		if (ctl.find("STOP") != string::npos) { os << "stopped by user." << endl; break; }
+
+		// Wrap the raw bytes verbatim as an L3Frame and send to the handset.
+		GSM::L3Frame query((const char*)iBuf, (size_t)msgLen);
+		LOG(NOTICE) << "testinject SAPI" << sapi << " sending " << query;
+		chan->send(query, sapi);
+
+		// Read the reply on the same SAPI; hand it back as raw bytes (explicit
+		// length, since the payload is binary and may contain 0x00).
+		GSM::L3Frame *resp = chan->recv(2000, sapi);
+		if (!resp) {
+			static const char tmo[] = "TIMEOUT";
+			controlSocket.writeBack(tmo, sizeof(tmo) - 1);
+			continue;
+		}
+		LOG(NOTICE) << "testinject SAPI" << sapi << " received " << *resp;
+		size_t respBytes = (resp->size() + 7) / 8;
+		unsigned char oBuf[respBytes ? respBytes : 1];
+		resp->pack(oBuf);
+		controlSocket.writeBack((char*)oBuf, respBytes);
+		delete resp;
+	}
+
+	controlSocket.close();
+	if (!chan->active()) os << "channel went inactive; injection ended." << endl;
+	return SUCCESS;
+}
 
 
 int power(int argc, char **argv, ostream& os)
@@ -1282,6 +1386,7 @@ void Parser::addCommands()
 	addCommand("version", version,"-- print the version string");
 	addCommand("page", page, "print the paging table");
 	addCommand("chans", chans, "-- report PHY status for active channels");
+	addCommand("testinject", testinject, "[index [port [sapi]]] -- list active dedicated channels, or open a UDP socket (default 28670) to inject raw L3 frames (MM/CC/RR/SMS) onto active channel <index>");
 	addCommand("power", power, "[minAtten maxAtten] -- report current attentuation or set min/max bounds");
         addCommand("rxgain", rxgain, "[newRxgain] -- get/set the RX gain in dB");
         addCommand("txatten", txatten, "[newTxAtten] -- get/set the TX attenuation in dB");
